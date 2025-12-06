@@ -1,0 +1,21 @@
+{
+  "best_params": {
+    "gamma": 0.35,
+    "min_area": 100,
+    "max_area": 3000,
+    "min_circularity": 0.4,
+    "min_convexity": 0.65,
+    "min_inertia": 0.22,
+    "clahe_clip": 2.0,
+    "gaussian_size": 5,
+    "top_mask_percent": 0.4,
+    "hsv_s_max": 50,
+    "hsv_v_min": 100,
+    "morph_size": 5,
+    "adaptive_block_size": 11,
+    "adaptive_c": 2
+  },
+  "best_mae": 16.1,
+  "progress": "117/729",
+  "timestamp": "2025-12-04 19:09:53"
+}

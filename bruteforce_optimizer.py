@@ -1,7 +1,9 @@
 """
-Brute Force Parameter Optimizer
-Systematically explores parameter space by running detector_final.py
-Starts from minimum values and incrementally increases each parameter
+Improved Brute Force Parameter Optimizer
+- Uses multiprocessing for parallel execution
+- Saves checkpoints during optimization
+- Can resume from previous run
+- Shows real-time progress with best parameters
 """
 
 import os
@@ -12,22 +14,34 @@ import matplotlib.pyplot as plt
 import time
 from itertools import product
 import numpy as np
+from multiprocessing import Pool, cpu_count
+from functools import partial
+import signal
+import sys
 
 
 class BruteForceOptimizer:
-    
-    def __init__(self, detector_script='detector_final.py', 
-                 images_dir='images', 
-                 annotations_path='coordinates.csv'):
+
+    def __init__(self, detector_script='detector_final.py',
+                 images_dir='images',
+                 annotations_path='coordinates.csv',
+                 n_workers=None):
         self.detector_script = detector_script
         self.images_dir = images_dir
         self.annotations_path = annotations_path
         self.results_dir = 'optimization_results'
         os.makedirs(self.results_dir, exist_ok=True)
-        
+
+        # Set number of workers (leave 1 core free for system)
+        self.n_workers = n_workers or max(1, cpu_count() - 1)
+
         # Parameter explanations
         self.param_explanations = self._get_parameter_explanations()
-    
+
+        # Checkpoint file
+        self.checkpoint_file = None
+        self.best_params_file = None
+
     def _get_parameter_explanations(self):
         """Complete explanation of each parameter"""
         return {
@@ -45,7 +59,7 @@ class BruteForceOptimizer:
                 'optimal_range': '2.0-3.0',
                 'priority': 'MEDIUM'
             },
-            
+
             'gamma': {
                 'name': 'Gamma Correction',
                 'min': 0.3,
@@ -60,7 +74,7 @@ class BruteForceOptimizer:
                 'optimal_range': '0.35-0.45',
                 'priority': 'HIGH - Critical for shadow regions'
             },
-            
+
             'gaussian_size': {
                 'name': 'Gaussian Blur Kernel Size',
                 'values': [3, 5, 7],
@@ -73,7 +87,7 @@ class BruteForceOptimizer:
                 'optimal_range': '5 (usually best)',
                 'priority': 'LOW'
             },
-            
+
             'top_mask_percent': {
                 'name': 'Top Masking Percentage',
                 'min': 0.30,
@@ -88,7 +102,7 @@ class BruteForceOptimizer:
                 'optimal_range': '0.35-0.45',
                 'priority': 'MEDIUM'
             },
-            
+
             'hsv_s_max': {
                 'name': 'HSV Saturation Maximum (Sand Removal)',
                 'min': 40,
@@ -103,7 +117,7 @@ class BruteForceOptimizer:
                 'optimal_range': '45-55',
                 'priority': 'MEDIUM'
             },
-            
+
             'hsv_v_min': {
                 'name': 'HSV Value Minimum (Sand Removal)',
                 'min': 80,
@@ -118,7 +132,7 @@ class BruteForceOptimizer:
                 'optimal_range': '90-110',
                 'priority': 'MEDIUM'
             },
-            
+
             'morph_size': {
                 'name': 'Morphology Kernel Size',
                 'values': [3, 5, 7],
@@ -131,7 +145,7 @@ class BruteForceOptimizer:
                 'optimal_range': '5 (usually best)',
                 'priority': 'LOW'
             },
-            
+
             'adaptive_block_size': {
                 'name': 'Adaptive Threshold Block Size',
                 'values': [9, 11, 13, 15],
@@ -144,7 +158,7 @@ class BruteForceOptimizer:
                 'optimal_range': '11 (usually best)',
                 'priority': 'LOW'
             },
-            
+
             'adaptive_c': {
                 'name': 'Adaptive Threshold Constant',
                 'values': [1, 2, 3],
@@ -157,7 +171,7 @@ class BruteForceOptimizer:
                 'optimal_range': '2 (usually best)',
                 'priority': 'LOW'
             },
-            
+
             # BLOB DETECTION PARAMETERS
             'min_area': {
                 'name': 'Minimum Blob Area',
@@ -173,7 +187,7 @@ class BruteForceOptimizer:
                 'optimal_range': '80-120',
                 'priority': 'HIGH - Affects recall (missing far people)'
             },
-            
+
             'max_area': {
                 'name': 'Maximum Blob Area',
                 'min': 2000,
@@ -188,7 +202,7 @@ class BruteForceOptimizer:
                 'optimal_range': '2500-3500',
                 'priority': 'HIGH - Affects precision (false positives from large objects)'
             },
-            
+
             'min_circularity': {
                 'name': 'Minimum Circularity',
                 'min': 0.30,
@@ -203,7 +217,7 @@ class BruteForceOptimizer:
                 'optimal_range': '0.35-0.45',
                 'priority': 'HIGH - Critical for rejecting elongated non-people'
             },
-            
+
             'min_convexity': {
                 'name': 'Minimum Convexity',
                 'min': 0.60,
@@ -218,7 +232,7 @@ class BruteForceOptimizer:
                 'optimal_range': '0.65-0.75',
                 'priority': 'MEDIUM - Rejects noise clusters'
             },
-            
+
             'min_inertia': {
                 'name': 'Minimum Inertia Ratio',
                 'min': 0.15,
@@ -234,43 +248,43 @@ class BruteForceOptimizer:
                 'priority': 'CRITICAL - Most important blob parameter!'
             }
         }
-    
+
     def print_parameter_guide(self):
         """Print comprehensive parameter guide"""
         print("=" * 80)
         print("PARAMETER OPTIMIZATION GUIDE")
         print("=" * 80)
         print()
-        
+
         categories = {
             'PREPROCESSING': ['clahe_clip', 'gamma', 'gaussian_size', 'top_mask_percent',
                              'hsv_s_max', 'hsv_v_min', 'morph_size', 'adaptive_block_size', 'adaptive_c'],
             'BLOB DETECTION': ['min_area', 'max_area', 'min_circularity', 'min_convexity', 'min_inertia']
         }
-        
+
         for category, params in categories.items():
             print(f"\n{'='*80}")
             print(f"{category}")
             print(f"{'='*80}\n")
-            
+
             for param in params:
                 info = self.param_explanations[param]
                 print(f"📊 {info['name']} ({param})")
                 print(f"   Priority: {info['priority']}")
-                
+
                 if 'values' in info:
                     print(f"   Options: {info['values']} (default: {info['default']})")
                 else:
                     print(f"   Range: {info['min']} to {info['max']} step {info['step']} (default: {info['default']})")
-                
+
                 print(f"   Why: {info['why']}")
                 print(f"   Effect: {info['effect']}")
                 print(f"   Optimal: {info['optimal_range']}")
                 print()
-    
+
     def generate_parameter_combinations(self, mode='standard'):
         """Generate parameter combinations based on mode"""
-        
+
         if mode == 'minimal':
             # Test only critical parameters
             return {
@@ -290,7 +304,7 @@ class BruteForceOptimizer:
                 'adaptive_block_size': [11],
                 'adaptive_c': [2]
             }
-        
+
         elif mode == 'standard':
             # Test high/medium priority parameters
             return {
@@ -309,185 +323,353 @@ class BruteForceOptimizer:
                 'min_convexity': [0.65, 0.70, 0.75],
                 'min_inertia': [0.18, 0.20, 0.22]
             }
-        
+
+        elif mode == 'quick':
+            # Quick test with fewer combinations (~100)
+            return {
+                'gamma': [0.35, 0.40, 0.45],
+                'min_area': [80, 100],
+                'max_area': [2500, 3000],
+                'min_circularity': [0.35, 0.40],
+                'min_convexity': [0.65, 0.70],
+                'min_inertia': [0.18, 0.20, 0.22],
+                'clahe_clip': [2.0],
+                'gaussian_size': [5],
+                'top_mask_percent': [0.40],
+                'hsv_s_max': [50],
+                'hsv_v_min': [100],
+                'morph_size': [5],
+                'adaptive_block_size': [11],
+                'adaptive_c': [2]
+            }
+
         else:
             raise ValueError(f"Unknown mode: {mode}")
-    
-    def run_detector_with_params(self, params):
-        """Run detector_final.py with given parameters"""
-        
-        # Save parameters to temporary JSON file
-        temp_params_file = os.path.join(self.results_dir, 'temp_params.json')
-        with open(temp_params_file, 'w') as f:
-            json.dump(params, f, indent=2)
-        
-        # Run detector script
+
+    @staticmethod
+    def run_single_combination(args):
+        """Run detector for a single parameter combination (static method for multiprocessing)"""
+        params, param_names, detector_script, result_idx, results_dir = args
+
+        # Create parameter dict
+        param_dict = dict(zip(param_names, params))
+
+        # Save parameters to worker-specific file
+        worker_id = os.getpid()
+        temp_params_file = os.path.join(results_dir, f'temp_params_worker_{worker_id}.json')
+
         try:
+            with open(temp_params_file, 'w') as f:
+                json.dump(param_dict, f, indent=2)
+
+            # Run detector script with timeout
             result = subprocess.run(
-                ['python', self.detector_script, temp_params_file, '--quiet'],
+                ['python', detector_script, temp_params_file, '--quiet'],
                 capture_output=True,
                 text=True,
-                timeout=60
+                timeout=120  # 2 minute timeout per combination
             )
-            
-            # Read results from summary.json
-            summary_file = 'outputs/summary.json'
+
+            # Read results
+            summary_file = f'outputs/summary_worker_{worker_id}.json'
             if os.path.exists(summary_file):
                 with open(summary_file, 'r') as f:
                     summary = json.load(f)
-                return summary['mean_mae']
+                mae = summary['mean_mae']
             else:
-                return float('inf')
-        
+                # Fallback to default output location
+                summary_file = 'outputs/summary.json'
+                if os.path.exists(summary_file):
+                    with open(summary_file, 'r') as f:
+                        summary = json.load(f)
+                    mae = summary['mean_mae']
+                else:
+                    mae = float('inf')
+
+            # Clean up temp file
+            if os.path.exists(temp_params_file):
+                os.remove(temp_params_file)
+
+            return (result_idx, param_dict, mae)
+
+        except subprocess.TimeoutExpired:
+            print(f"\n⚠️  Worker {worker_id} timed out on combination {result_idx}")
+            return (result_idx, param_dict, float('inf'))
+
         except Exception as e:
-            print(f"Error running detector: {e}")
-            return float('inf')
-    
-    def optimize(self, mode='standard', max_combinations=None):
-        """Run brute force optimization"""
-        
+            print(f"\n⚠️  Worker {worker_id} error on combination {result_idx}: {e}")
+            return (result_idx, param_dict, float('inf'))
+
+    def load_checkpoint(self, mode):
+        """Load checkpoint from previous run"""
+        checkpoint_file = os.path.join(self.results_dir, f'checkpoint_{mode}.json')
+
+        if os.path.exists(checkpoint_file):
+            print(f"\n📂 Found checkpoint: {checkpoint_file}")
+            with open(checkpoint_file, 'r') as f:
+                checkpoint = json.load(f)
+
+            print(f"   Completed: {checkpoint['completed']}/{checkpoint['total']} combinations")
+            print(f"   Best MAE so far: {checkpoint['best_mae']:.2f}")
+
+            response = input("   Resume from checkpoint? (y/n): ")
+            if response.lower() == 'y':
+                return checkpoint
+
+        return None
+
+    def save_checkpoint(self, mode, completed, total, best_mae, best_params, all_results):
+        """Save checkpoint during optimization"""
+        checkpoint = {
+            'mode': mode,
+            'completed': completed,
+            'total': total,
+            'best_mae': best_mae,
+            'best_params': best_params,
+            'all_results': all_results,
+            'timestamp': time.strftime('%Y-%m-%d %H:%M:%S')
+        }
+
+        with open(self.checkpoint_file, 'w') as f:
+            json.dump(checkpoint, f, indent=2)
+
+    def save_best_params_partial(self, best_params, best_mae, completed, total):
+        """Save best parameters found so far"""
+        best_data = {
+            'best_params': best_params,
+            'best_mae': best_mae,
+            'progress': f"{completed}/{total}",
+            'timestamp': time.strftime('%Y-%m-%d %H:%M:%S')
+        }
+
+        with open(self.best_params_file, 'w') as f:
+            json.dump(best_data, f, indent=2)
+
+    def optimize(self, mode='standard', max_combinations=None, resume=True):
+        """Run brute force optimization with multiprocessing"""
+
         print("=" * 80)
-        print("BRUTE FORCE PARAMETER OPTIMIZATION")
+        print("PARALLEL BRUTE FORCE PARAMETER OPTIMIZATION")
         print("=" * 80)
         print(f"\nMode: {mode}")
+        print(f"Workers: {self.n_workers} CPU cores")
         print()
-        
+
+        # Setup checkpoint files
+        self.checkpoint_file = os.path.join(self.results_dir, f'checkpoint_{mode}.json')
+        self.best_params_file = os.path.join(self.results_dir, f'best_params_live_{mode}.json')
+
+        # Try to resume from checkpoint
+        checkpoint = None
+        if resume:
+            checkpoint = self.load_checkpoint(mode)
+
         # Generate parameter combinations
         param_ranges = self.generate_parameter_combinations(mode)
-        
-        # Print what will be tested
+        param_names = list(param_ranges.keys())
+        param_values = [param_ranges[name] for name in param_names]
+
+        # Generate all combinations
+        all_combinations = list(product(*param_values))
+        if max_combinations:
+            all_combinations = all_combinations[:max_combinations]
+
+        total_combinations = len(all_combinations)
+
+        # Resume from checkpoint if available
+        if checkpoint:
+            completed_indices = set(r['index'] for r in checkpoint['all_results'])
+            remaining_combinations = [(i, combo) for i, combo in enumerate(all_combinations)
+                                     if i not in completed_indices]
+            best_mae = checkpoint['best_mae']
+            best_params = checkpoint['best_params']
+            all_results = checkpoint['all_results']
+            start_idx = len(all_results)
+
+            print(f"Resuming: {len(remaining_combinations)} combinations remaining")
+        else:
+            remaining_combinations = list(enumerate(all_combinations))
+            best_mae = float('inf')
+            best_params = None
+            all_results = []
+            start_idx = 0
+
+        # Print optimization info
         print("Parameters to optimize:")
         for param, values in param_ranges.items():
             info = self.param_explanations[param]
             if len(values) > 1:
                 print(f"  {param}: {len(values)} values - Priority: {info['priority']}")
-        
-        # Calculate total combinations
-        total_combinations = np.prod([len(v) for v in param_ranges.values()])
+
         print(f"\nTotal combinations: {total_combinations}")
-        
-        if max_combinations and total_combinations > max_combinations:
-            print(f"WARNING: Limited to {max_combinations} combinations")
-            total_combinations = max_combinations
-        
-        print(f"Estimated time: {total_combinations * 2 / 60:.1f} minutes")
+        print(f"Estimated time (sequential): {total_combinations * 2 / 60:.1f} minutes")
+        print(f"Estimated time (parallel): {total_combinations * 2 / 60 / self.n_workers:.1f} minutes")
         print()
-        
-        response = input("Continue? (y/n): ")
-        if response.lower() != 'y':
-            print("Optimization cancelled.")
-            return None
-        
-        # Generate all combinations
-        param_names = list(param_ranges.keys())
-        param_values = [param_ranges[name] for name in param_names]
-        
-        best_mae = float('inf')
-        best_params = None
-        all_results = []
-        
+
+        if not checkpoint:
+            response = input("Continue? (y/n): ")
+            if response.lower() != 'y':
+                print("Optimization cancelled.")
+                return None
+
+        # Prepare arguments for multiprocessing
+        tasks = [
+            (combo, param_names, self.detector_script, idx, self.results_dir)
+            for idx, combo in remaining_combinations
+        ]
+
+        print(f"\n{'='*80}")
+        print("OPTIMIZATION STARTED")
+        print(f"{'='*80}\n")
+
         start_time = time.time()
-        
-        combinations = list(product(*param_values))
-        if max_combinations:
-            combinations = combinations[:max_combinations]
-        
-        for i, combination in enumerate(combinations):
-            # Create parameter dict
-            params = dict(zip(param_names, combination))
-            
-            # Test this combination
-            print(f"[{i+1}/{len(combinations)}] Testing...", end=' ')
-            mae = self.run_detector_with_params(params)
-            
-            # Store result
-            result = params.copy()
-            result['mae'] = mae
-            all_results.append(result)
-            
-            # Check if best
-            if mae < best_mae:
-                best_mae = mae
-                best_params = params.copy()
-                print(f"✓ NEW BEST! MAE: {mae:.2f}")
-                print(f"    Key params: gamma={params['gamma']:.2f}, "
-                      f"minArea={params['min_area']}, inertia={params['min_inertia']:.2f}")
-            else:
-                print(f"MAE: {mae:.2f}")
-            
-            # Progress update
-            if (i + 1) % 10 == 0:
-                elapsed = time.time() - start_time
-                eta = (elapsed / (i + 1)) * (len(combinations) - i - 1)
-                print(f"    Progress: {(i+1)/len(combinations)*100:.1f}% | "
-                      f"Elapsed: {elapsed/60:.1f}min | ETA: {eta/60:.1f}min | "
-                      f"Best: {best_mae:.2f}")
-        
+
+        # Use multiprocessing pool
+        try:
+            with Pool(processes=self.n_workers) as pool:
+                # Process results as they complete
+                for i, (result_idx, param_dict, mae) in enumerate(pool.imap_unordered(
+                    self.run_single_combination, tasks)):
+
+                    # Store result
+                    result = param_dict.copy()
+                    result['mae'] = mae
+                    result['index'] = result_idx
+                    all_results.append(result)
+
+                    completed = start_idx + i + 1
+
+                    # Check if best
+                    if mae < best_mae:
+                        best_mae = mae
+                        best_params = param_dict.copy()
+
+                        print(f"[{completed}/{total_combinations}] ⭐ NEW BEST! MAE: {mae:.2f}")
+                        print(f"    gamma={param_dict['gamma']:.2f}, "
+                              f"minArea={param_dict['min_area']}, "
+                              f"maxArea={param_dict['max_area']}, "
+                              f"circ={param_dict['min_circularity']:.2f}, "
+                              f"inertia={param_dict['min_inertia']:.2f}")
+
+                        # Save best parameters immediately
+                        self.save_best_params_partial(best_params, best_mae, completed, total_combinations)
+
+                    else:
+                        # Periodic progress update (every 5%)
+                        if completed % max(1, total_combinations // 20) == 0:
+                            elapsed = time.time() - start_time
+                            eta = (elapsed / completed) * (total_combinations - completed)
+                            progress = completed / total_combinations * 100
+
+                            print(f"[{completed}/{total_combinations}] "
+                                  f"Progress: {progress:.1f}% | "
+                                  f"Elapsed: {elapsed/60:.1f}min | "
+                                  f"ETA: {eta/60:.1f}min | "
+                                  f"Best MAE: {best_mae:.2f}")
+
+                    # Save checkpoint every 10% or every 50 combinations
+                    if completed % max(10, total_combinations // 10) == 0:
+                        self.save_checkpoint(mode, completed, total_combinations,
+                                           best_mae, best_params, all_results)
+                        print(f"    💾 Checkpoint saved")
+
+        except KeyboardInterrupt:
+            print("\n\n⚠️  Optimization interrupted by user")
+            print("Saving checkpoint...")
+            self.save_checkpoint(mode, len(all_results), total_combinations,
+                               best_mae, best_params, all_results)
+            print("✓ Checkpoint saved. You can resume later.")
+            return None
+
         elapsed = time.time() - start_time
-        print(f"\nCompleted in {elapsed/60:.1f} minutes")
-        
-        # Save results
-        self._save_results(best_params, all_results, mode)
-        
+        print(f"\n{'='*80}")
+        print(f"OPTIMIZATION COMPLETED in {elapsed/60:.1f} minutes")
+        print(f"{'='*80}\n")
+
+        # Save final results
+        self._save_results(best_params, best_mae, all_results, mode)
+
+        # Clean up checkpoint file
+        if os.path.exists(self.checkpoint_file):
+            os.remove(self.checkpoint_file)
+
         return best_params, all_results
-    
-    def _save_results(self, best_params, all_results, mode):
+
+    def _save_results(self, best_params, best_mae, all_results, mode):
         """Save optimization results"""
-        
+
         # Convert to DataFrame
         results_df = pd.DataFrame(all_results)
+        if 'index' in results_df.columns:
+            results_df = results_df.drop('index', axis=1)
         results_df = results_df.sort_values('mae')
-        
+
         # Save CSV
         csv_file = os.path.join(self.results_dir, f'bruteforce_{mode}_results.csv')
         results_df.to_csv(csv_file, index=False)
-        
+
         # Save best parameters
         params_file = os.path.join(self.results_dir, f'best_params_bruteforce_{mode}.json')
+        best_data = {
+            'best_params': best_params,
+            'best_mae': best_mae,
+            'timestamp': time.strftime('%Y-%m-%d %H:%M:%S')
+        }
         with open(params_file, 'w') as f:
-            json.dump(best_params, f, indent=2)
-        
+            json.dump(best_data, f, indent=2)
+
         # Print summary
         print("\n" + "=" * 80)
         print("OPTIMIZATION RESULTS")
         print("=" * 80)
-        print(f"Best MAE: {best_params.get('mae', results_df['mae'].min()):.2f}\n")
-        
+        print(f"Best MAE: {best_mae:.2f}\n")
+
         # Print by priority
         print("CRITICAL PARAMETERS:")
         for param, info in self.param_explanations.items():
-            if info['priority'] == 'CRITICAL' or 'CRITICAL' in info['priority']:
+            if 'CRITICAL' in str(info['priority']):
                 print(f"  {param}: {best_params[param]} (optimal: {info['optimal_range']})")
-        
+
         print("\nHIGH PRIORITY:")
         for param, info in self.param_explanations.items():
-            if info['priority'] == 'HIGH' and param not in ['min_inertia']:
+            if info['priority'] == 'HIGH':
                 print(f"  {param}: {best_params[param]} (optimal: {info['optimal_range']})")
-        
+
         print("\nMEDIUM PRIORITY:")
         for param, info in self.param_explanations.items():
             if info['priority'] == 'MEDIUM':
                 print(f"  {param}: {best_params[param]}")
-        
+
         print(f"\n{'='*80}")
         print("Files saved:")
         print(f"  - {params_file}")
         print(f"  - {csv_file}")
-        print(f"{'='*80}")
-        
+
         # Plot results
         self._plot_results(results_df, mode)
-        
+
+        print(f"  - {os.path.join(self.results_dir, f'analysis_{mode}.png')}")
+        print(f"{'='*80}")
+
+        # Show top 10
+        print("\n" + "=" * 80)
+        print("TOP 10 PARAMETER COMBINATIONS")
+        print("=" * 80)
+        top_cols = ['mae', 'gamma', 'min_area', 'max_area', 'min_circularity',
+                    'min_convexity', 'min_inertia']
+        print(results_df[top_cols].head(10).to_string(index=False))
+        print()
+
         return results_df
-    
+
     def _plot_results(self, results_df, mode):
         """Plot optimization results"""
-        
+
         # Top 20 parameters
         top_results = results_df.head(20)
-        
+
         fig, axes = plt.subplots(2, 3, figsize=(16, 10))
-        
+
         critical_params = [
             ('gamma', 'Gamma'),
             ('min_area', 'Min Area'),
@@ -496,20 +678,20 @@ class BruteForceOptimizer:
             ('min_convexity', 'Min Convexity'),
             ('min_inertia', 'Min Inertia ⭐')
         ]
-        
+
         for idx, (param, label) in enumerate(critical_params):
             ax = axes[idx // 3, idx % 3]
-            
+
             x = range(len(top_results))
             y = top_results[param].values
             colors = top_results['mae'].values
-            
+
             scatter = ax.scatter(x, y, c=colors, cmap='RdYlGn_r', s=120, alpha=0.7)
             ax.set_xlabel('Rank (0=best)', fontsize=11, fontweight='bold')
             ax.set_ylabel(label, fontsize=11, fontweight='bold')
             ax.set_title(f'Top 20: {label}', fontsize=12, fontweight='bold')
             ax.grid(True, alpha=0.3)
-            
+
             # Highlight optimal range
             info = self.param_explanations[param]
             if 'optimal_range' in info and '-' in str(info['optimal_range']):
@@ -519,62 +701,68 @@ class BruteForceOptimizer:
                     ax.legend(fontsize=8)
                 except:
                     pass
-            
+
             plt.colorbar(scatter, ax=ax, label='MAE')
-        
-        plt.suptitle(f'Parameter Analysis - {mode.title()} Mode', fontsize=14, fontweight='bold')
+
+        plt.suptitle(f'Parameter Analysis - {mode.title()} Mode\n'
+                     f'Best MAE: {top_results["mae"].iloc[0]:.2f}',
+                     fontsize=14, fontweight='bold')
         plt.tight_layout()
-        
+
         plot_file = os.path.join(self.results_dir, f'analysis_{mode}.png')
         plt.savefig(plot_file, dpi=150)
         plt.close()
-        
-        print(f"  - {plot_file}")
 
 
 def main():
     print("=" * 80)
-    print("BRUTE FORCE PARAMETER OPTIMIZER")
+    print("PARALLEL BRUTE FORCE PARAMETER OPTIMIZER")
     print("=" * 80)
-    print("\nSystematic exploration of parameter space")
-    print("Runs detector_final.py with different parameter combinations")
+    print(f"\nAvailable CPU cores: {cpu_count()}")
+    print("Systematic exploration with multiprocessing")
     print()
-    
-    optimizer = BruteForceOptimizer()
-    
-    print("Choose optimization mode:")
-    print("  1. Minimal - Critical parameters only (~729 combinations, ~25 min)")
-    print("  2. Standard - High/Medium priority (~3888 combinations, ~130 min)")
+
+    # Allow custom worker count
+    n_workers = input(f"Number of workers (default={max(1, cpu_count()-1)}): ").strip()
+    n_workers = int(n_workers) if n_workers else None
+
+    optimizer = BruteForceOptimizer(n_workers=n_workers)
+
+    print("\nChoose optimization mode:")
+    print("  1. Quick - Fast test (~144 combinations, ~5 min with 4 cores)")
+    print("  2. Minimal - Critical parameters (~729 combinations, ~20 min with 4 cores)")
+    print("  3. Standard - High/Medium priority (~3888 combinations, ~110 min with 4 cores)")
     print("  4. Show parameter guide")
-    
+
     choice = input("\nEnter choice (1-4): ").strip()
-    
+
     if choice == '1':
+        mode = 'quick'
+        best_params, results = optimizer.optimize(mode=mode)
+
+    elif choice == '2':
         mode = 'minimal'
         best_params, results = optimizer.optimize(mode=mode)
-        
-    elif choice == '2':
+
+    elif choice == '3':
         mode = 'standard'
         best_params, results = optimizer.optimize(mode=mode)
-        
+
     elif choice == '4':
         optimizer.print_parameter_guide()
         return
-    
+
     else:
         print("Invalid choice")
         return
-    
-    # Show top 10 results
-    if results is not None:
-        results_df = pd.DataFrame(results).sort_values('mae')
-        print("\n" + "=" * 80)
-        print("TOP 10 PARAMETER COMBINATIONS")
-        print("=" * 80)
-        print(results_df[['mae', 'gamma', 'min_area', 'max_area', 'min_circularity', 
-                          'min_convexity', 'min_inertia']].head(10).to_string(index=False))
-        print()
 
 
 if __name__ == "__main__":
+    # Handle Ctrl+C gracefully
+    def signal_handler(sig, frame):
+        print('\n\n⚠️  Caught interrupt signal. Exiting gracefully...')
+        sys.exit(0)
+
+    signal.signal(signal.SIGINT, signal_handler)
+
     main()

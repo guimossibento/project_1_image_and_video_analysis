@@ -1,0 +1,20 @@
+{
+  "best_params": {
+    "clahe_clip": 2.0,
+    "gamma": 0.35,
+    "gaussian_size": 5,
+    "top_mask_percent": 0.45,
+    "hsv_s_max": 50,
+    "hsv_v_min": 110,
+    "morph_size": 5,
+    "adaptive_block_size": 11,
+    "adaptive_c": 2,
+    "min_area": 80,
+    "max_area": 2500,
+    "min_circularity": 0.35,
+    "min_convexity": 0.75,
+    "min_inertia": 0.18
+  },
+  "best_mae": 13.9,
+  "timestamp": "2025-12-06 04:31:40"
+}

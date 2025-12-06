@@ -6,6 +6,7 @@ import os
 import json
 import sys
 from pathlib import Path
+import argparse
 
 
 def adjust_gamma(image, gamma=0.4):
@@ -14,43 +15,236 @@ def adjust_gamma(image, gamma=0.4):
     return np.clip(img * 255.0, 0, 255).astype(np.uint8)
 
 
+def get_blob_params_level(level):
+    """
+    Get blob detection parameters by accuracy level.
+
+    Level 1:  Ultra loose  - catches everything, many false positives
+    Level 5:  Balanced     - good trade-off between recall and precision
+    Level 10: Ultra strict - high precision, may miss some people
+
+    PARAMETER EXPLANATIONS:
+    =======================
+
+    min_area (pixels²):
+        Minimum blob size to consider. People in beach images typically occupy
+        300-5000 pixels depending on distance from camera. Lower values catch
+        distant people but also noise; higher values miss distant/small people.
+
+    max_area (pixels²):
+        Maximum blob size. Prevents detecting large regions like umbrellas,
+        beach towels, or merged groups as single entities. People rarely
+        exceed 15000-20000 pixels unless very close to camera.
+
+    min_circularity (0-1):
+        Measures how close to a perfect circle: 4π × Area / Perimeter²
+        - Circle = 1.0
+        - Square ≈ 0.785
+        - Human silhouette ≈ 0.2-0.5
+        Low values accept elongated shapes (standing people, shadows).
+        High values reject irregular shapes but may miss seated/lying people.
+
+    min_convexity (0-1):
+        Ratio of blob area to its convex hull area.
+        - Solid shape = 1.0
+        - Shape with indentations < 1.0
+        People with arms out or partial occlusion have lower convexity (~0.4-0.7).
+        Low values accept fragmented detections; high values require solid blobs.
+
+    min_inertia (0-1):
+        Measures elongation (ratio of minor to major axis).
+        - Circle = 1.0
+        - Line = 0.0
+        Standing people are elongated (~0.1-0.3), sitting people rounder (~0.4-0.6).
+        Low values accept standing silhouettes; high values prefer compact shapes.
+    """
+
+    blob_params = {
+        # Level 1 - Ultra Loose
+        # Use case: Initial exploration, ensure nothing is missed
+        # Trade-off: Many false positives (rocks, debris, shadows)
+        1: {
+            'min_area': 30,
+            'max_area': 60000,
+            'min_circularity': 0.02,
+            'min_convexity': 0.15,
+            'min_inertia': 0.005
+        },
+
+        # Level 2 - Very Loose
+        # Use case: Crowded scenes where people overlap significantly
+        # Trade-off: Still catches noise, but filters extreme outliers
+        2: {
+            'min_area': 80,
+            'max_area': 50000,
+            'min_circularity': 0.05,
+            'min_convexity': 0.20,
+            'min_inertia': 0.01
+        },
+
+        # Level 3 - Loose
+        # Use case: Distant crowds, small people in frame
+        # Trade-off: Good recall for distant people, some false positives
+        3: {
+            'min_area': 150,
+            'max_area': 40000,
+            'min_circularity': 0.08,
+            'min_convexity': 0.28,
+            'min_inertia': 0.02
+        },
+
+        # Level 4 - Moderately Loose
+        # Use case: Mixed distances, some occlusion expected
+        # Trade-off: Balances distant detection with noise reduction
+        4: {
+            'min_area': 220,
+            'max_area': 32000,
+            'min_circularity': 0.12,
+            'min_convexity': 0.35,
+            'min_inertia': 0.035
+        },
+
+        # Level 5 - Balanced (DEFAULT)
+        # Use case: General purpose, typical beach scenes
+        # Trade-off: Best overall accuracy for most scenarios
+        5: {
+            'min_area': 300,
+            'max_area': 25000,
+            'min_circularity': 0.15,
+            'min_convexity': 0.42,
+            'min_inertia': 0.05
+        },
+
+        # Level 6 - Moderately Strict
+        # Use case: Cleaner images, less noise in background
+        # Trade-off: May miss some distant or partially occluded people
+        6: {
+            'min_area': 380,
+            'max_area': 20000,
+            'min_circularity': 0.20,
+            'min_convexity': 0.48,
+            'min_inertia': 0.07
+        },
+
+        # Level 7 - Strict
+        # Use case: Close-up scenes, clear visibility
+        # Trade-off: Good precision, misses distant/small people
+        7: {
+            'min_area': 450,
+            'max_area': 17000,
+            'min_circularity': 0.25,
+            'min_convexity': 0.55,
+            'min_inertia': 0.09
+        },
+
+        # Level 8 - Very Strict
+        # Use case: High-quality images, minimal occlusion
+        # Trade-off: High precision, lower recall
+        8: {
+            'min_area': 520,
+            'max_area': 14000,
+            'min_circularity': 0.30,
+            'min_convexity': 0.62,
+            'min_inertia': 0.11
+        },
+
+        # Level 9 - Extra Strict
+        # Use case: When false positives are costly
+        # Trade-off: Very few false positives, misses many true positives
+        9: {
+            'min_area': 600,
+            'max_area': 12000,
+            'min_circularity': 0.38,
+            'min_convexity': 0.70,
+            'min_inertia': 0.14
+        },
+
+        # Level 10 - Ultra Strict
+        # Use case: Only detect very clear, well-defined people
+        # Trade-off: Minimal false positives, significant missed detections
+        10: {
+            'min_area': 700,
+            'max_area': 10000,
+            'min_circularity': 0.45,
+            'min_convexity': 0.78,
+            'min_inertia': 0.18
+        }
+    }
+
+    return blob_params.get(level, blob_params[5])
+
+
+def get_level_name(level):
+    """Get human-readable name for each level."""
+    names = {
+        1: 'ultra loose',
+        2: 'very loose',
+        3: 'loose',
+        4: 'moderately loose',
+        5: 'balanced',
+        6: 'moderately strict',
+        7: 'strict',
+        8: 'very strict',
+        9: 'extra strict',
+        10: 'ultra strict'
+    }
+    return names.get(level, 'balanced')
+
+
+def print_blob_params_table():
+    """Print a formatted table of all blob parameters."""
+    print("\n" + "=" * 85)
+    print("BLOB DETECTION PARAMETERS BY LEVEL")
+    print("=" * 85)
+    print(f"{'Level':<6} {'Name':<18} {'min_area':<10} {'max_area':<10} "
+          f"{'circ':<8} {'conv':<8} {'inertia':<8}")
+    print("-" * 85)
+
+    for level in range(1, 11):
+        params = get_blob_params_level(level)
+        name = get_level_name(level)
+        print(f"{level:<6} {name:<18} {params['min_area']:<10} {params['max_area']:<10} "
+              f"{params['min_circularity']:<8.3f} {params['min_convexity']:<8.2f} "
+              f"{params['min_inertia']:<8.3f}")
+
+    print("=" * 85 + "\n")
+
+
 class BeachCrowdCounter:
 
     def __init__(self, images_dir='images', annotations_path='coordinates.csv',
-                 output_dir='outputs', params=None):
+                 output_dir='outputs', params=None, level='balanced'):
         self.images_dir = images_dir
         self.annotations_path = annotations_path
         self.output_dir = output_dir
-        
+
         # Load parameters
         if params is None:
-            self.params = self.default_params()
+            self.params = self.default_params(level)
         else:
             self.params = params
 
         os.makedirs(output_dir, exist_ok=True)
         self.annotations = self._load_annotations()
-    
-    def default_params(self):
-        """Default parameters with explanations"""
+
+    def default_params(self, accuracy_level=3):
+        """Default parameters with configurable blob accuracy level"""
+
+        blob = get_blob_params_level(accuracy_level)
+
         return {
-            # Preprocessing
             'clahe_clip': 2.0,
             'gamma': 0.4,
             'gaussian_size': 5,
-            'top_mask_percent': 0.40,
+            'top_mask_percent': 0.45,
             'hsv_s_max': 50,
             'hsv_v_min': 100,
             'morph_size': 5,
             'adaptive_block_size': 11,
             'adaptive_c': 2,
-            
-            # Blob detection
-            'min_area': 100,
-            'max_area': 3000,
-            'min_circularity': 0.4,
-            'min_convexity': 0.7,
-            'min_inertia': 0.20
+
+            # Blob detection (from selected level)
+            **blob
         }
 
     def _load_annotations(self):
@@ -79,14 +273,14 @@ class BeachCrowdCounter:
         lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
         l, a, b = cv2.split(lab)
 
-        clahe = cv2.createCLAHE(clipLimit=float(self.params['clahe_clip']), 
+        clahe = cv2.createCLAHE(clipLimit=float(self.params['clahe_clip']),
                                 tileGridSize=(8, 8))
         l_clahe = clahe.apply(l)
 
         lab_clahe = cv2.merge([l_clahe, a, b])
         enhanced = cv2.cvtColor(lab_clahe, cv2.COLOR_LAB2BGR)
         enhanced = adjust_gamma(enhanced, gamma=float(self.params['gamma']))
-        
+
         blur_size = int(self.params['gaussian_size'])
         if blur_size % 2 == 0:
             blur_size += 1
@@ -118,7 +312,7 @@ class BeachCrowdCounter:
         if block_size % 2 == 0:
             block_size += 1
         thresh = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                       cv2.THRESH_BINARY, block_size, 
+                                       cv2.THRESH_BINARY, block_size,
                                        int(self.params['adaptive_c']))
 
         params = cv2.SimpleBlobDetector_Params()
@@ -153,8 +347,8 @@ class BeachCrowdCounter:
         axes[0, 1].axis('off')
 
         axes[0, 2].imshow(mask, cmap='gray')
-        axes[0, 2].set_title(f'Spatial Mask (Top {int(self.params["top_mask_percent"]*100)}% Excluded)', 
-                            fontsize=14, fontweight='bold')
+        axes[0, 2].set_title(f'Spatial Mask (Top {int(self.params["top_mask_percent"] * 100)}% Excluded)',
+                             fontsize=14, fontweight='bold')
         axes[0, 2].axis('off')
 
         img_gt = cv2.cvtColor(image, cv2.COLOR_BGR2RGB).copy()
@@ -227,7 +421,7 @@ class BeachCrowdCounter:
             'image_size': f"{image.shape[1]}x{image.shape[0]}"
         }
 
-    def process_all_images(self, visualize_all=False, verbose=True):
+    def process_all_images(self, visualize_all=True, verbose=True):
         image_files = [f for f in os.listdir(self.images_dir)
                        if f.lower().endswith(('.jpg', '.jpeg', '.png'))]
 
@@ -320,51 +514,124 @@ class BeachCrowdCounter:
         print(f"\nPlot saved: {plot_path}")
 
 
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description='Beach Crowd Counter - Detect and count people in beach images',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog='''
+Examples:
+  python main.py                              # Run with balanced (default) params
+  python main.py --level 8                   # Run with very strict detection
+  python main.py --level 2 -v                # Very loose detection + visualization
+  python main.py params.json                 # Load params from JSON file
+  python main.py params.json --level 7       # JSON params override level
+
+Levels:
+  1  = Ultra loose       (max recall, many false positives)
+  2  = Very loose
+  3  = Loose
+  4  = Moderately loose
+  5  = Balanced (default)
+  6  = Moderately strict
+  7  = Strict
+  8  = Very strict
+  9  = Extra strict
+  10 = Ultra strict      (max precision, fewer detections)
+        '''
+    )
+
+    parser.add_argument(
+        'params_file',
+        nargs='?',
+        default=None,
+        help='JSON file with optimized parameters (optional)'
+    )
+
+    parser.add_argument(
+        '-l', '--level',
+        type=int,
+        choices=range(1, 11),
+        default=5,
+        metavar='1-10',
+        help='Detection accuracy level 1-10 (default: 5)'
+    )
+
+    parser.add_argument(
+        '-v', '--visualize',
+        action='store_true',
+        help='Show visualization for each processed image'
+    )
+
+    parser.add_argument(
+        '-q', '--quiet',
+        action='store_true',
+        help='Suppress verbose output'
+    )
+
+    parser.add_argument(
+        '-i', '--images-dir',
+        default='images',
+        help='Directory containing input images (default: images)'
+    )
+
+    parser.add_argument(
+        '-a', '--annotations',
+        default='coordinates.csv',
+        help='Path to annotations CSV file (default: coordinates.csv)'
+    )
+
+    parser.add_argument(
+        '-o', '--output-dir',
+        default='outputs',
+        help='Directory for output files (default: outputs)'
+    )
+
+    return parser.parse_args()
+
+
 def main():
-    # Check if parameters provided via command line
-    if len(sys.argv) > 1 and sys.argv[1].endswith('.json'):
+    args = parse_args()
+
+    # Determine parameters source
+    params = None
+
+    if args.params_file and args.params_file.endswith('.json'):
         # Load parameters from JSON file
-        params_file = sys.argv[1]
-        with open(params_file, 'r') as f:
-            params = json.load(f)
-        
-        print(f"Loaded parameters from {params_file}")
-        visualize = '--visualize' in sys.argv or '-v' in sys.argv
-        verbose = '--verbose' in sys.argv or not ('--quiet' in sys.argv or '-q' in sys.argv)
-        
-        counter = BeachCrowdCounter(
-            images_dir='images',
-            annotations_path='coordinates.csv',
-            output_dir='outputs',
-            params=params
-        )
-        
-        counter.process_all_images(visualize_all=visualize, verbose=verbose)
-        
+        with open(args.params_file, 'r') as f:
+            params = json.load(f)['best_params']
+        print(f"Loaded parameters from {args.params_file}")
+        print(f"Parameters: {params}")
     else:
-        # Standard run with default parameters
-        print("=" * 70)
-        print("BEACH CROWD COUNTING - BLOB DETECTION")
-        print("=" * 70)
-        
-        counter = BeachCrowdCounter(
-            images_dir='images',
-            annotations_path='coordinates.csv',
-            output_dir='outputs'
-        )
-        
-        counter.process_all_images(visualize_all=True, verbose=True)
-        
-        print("\n" + "=" * 70)
-        print("PROCESSING COMPLETE")
-        print("=" * 70)
-        print("\nOutput files:")
-        print("  - results.csv: Per-image detailed results")
-        print("  - summary.json: Overall statistics (includes parameters)")
-        print("  - performance.png: Accuracy visualization")
-        print("  - [image]_result.png: Individual results for each image")
-        print("=" * 70)
+        # Use level-based parameters
+        level_names = {
+            1: 'ultra loose',
+            2: 'very loose',
+            3: 'loose',
+            4: 'moderately loose',
+            5: 'balanced',
+            6: 'moderately strict',
+            7: 'strict',
+            8: 'very strict',
+            9: 'extra strict',
+            10: 'ultra strict'
+        }
+        print(f"Using detection level: {args.level} ({level_names[args.level]})")
+
+    # Create counter instance
+    counter = BeachCrowdCounter(
+        images_dir=args.images_dir,
+        annotations_path=args.annotations,
+        output_dir=args.output_dir,
+        params=params,
+        level=args.level
+    )
+
+    # Process images
+    counter.process_all_images(
+        visualize_all=args.visualize,
+        verbose=not args.quiet
+    )
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
